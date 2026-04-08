@@ -1,0 +1,28 @@
+# Data files - do not commit actual data
+data/
+
+# Model checkpoints
+models/
+
+# Output files
+outputs/
+
+# Virtual environment
+myenv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints
+
+# IDE files
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
