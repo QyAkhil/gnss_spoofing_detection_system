@@ -1,3 +1,7 @@
 numpy
 pandas
 matplotlib
+torch
+joblib
+xgboost
+scikit-learn
