@@ -60,6 +60,5 @@ def predict(test_path="data/test.csv", out_path="outputs/submission.csv"):
     submission.to_csv(out_path, index=False)
     print(f"Saved {len(submission)} rows → {out_path}")
 
-
 if __name__ == "__main__":
     predict()

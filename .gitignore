@@ -4,9 +4,6 @@ data/
 # Model checkpoints
 models/
 
-# Output files
-outputs/
-
 # Virtual environment
 myenv/
 
