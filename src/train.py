@@ -6,10 +6,11 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 from xgboost import XGBClassifier
-from sklearn.model_selection import StratifiedKFold, TimeSeriesSplit
-from sklearn.metrics import f1_score
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import f1_score, confusion_matrix, classification_report
 from sklearn.preprocessing import StandardScaler
 
+from sklearn.ensemble import IsolationForest
 from model import LSTMAutoencoder
 from features import build_features
 
@@ -31,24 +32,47 @@ np.random.seed(SEED)
 FEATURE_COLS = [
     "correlator_symmetry", "correlator_distortion",
     "prompt_balance", "pip_pqp_ratio", "PC_magnitude",
+    "ec_lc_ratio", "el_power_ratio",
     "residual_PD", "timing_residual",
+    "carrier_pseudo_consistency", "doppler_phase_consistency",
     "pseudo_rate", "doppler_velocity",
     "phase_jump", "tcd_jump", "real_pseudo_jump",
+    "pseudo_rate_accel", "tow_jump",
     "Carrier_Doppler_hz_roll_std", "CN0_roll_std", "Pseudorange_m_roll_std",
     "Carrier_Doppler_hz_diff", "CN0_diff", "Pseudorange_m_diff",
     "CN0_mean_time", "CN0_std_time",
     "Carrier_Doppler_hz_std_time", "Pseudorange_m_std_time",
-    "CN0_dev", "prn_count",
+    "CN0_dev", "prn_count", "pseudo_zero_flag",
+    "doppler_dev", "pseudo_dev",
 ]
 
 
-def make_sequences(X_arr, seq_len=SEQ_LEN):
-    n = len(X_arr) - seq_len + 1
-    if n <= 0:
-        pad   = np.zeros((seq_len - len(X_arr), X_arr.shape[1]))
-        X_arr = np.vstack([pad, X_arr])
-        return X_arr[np.newaxis]
-    return np.array([X_arr[i:i + seq_len] for i in range(n)])
+def add_iso_score(iso: IsolationForest, X: np.ndarray, feat_cols: list) -> pd.DataFrame:
+    """Append Isolation Forest anomaly score as a named column."""
+    scores = iso.score_samples(X).reshape(-1, 1)
+    return pd.DataFrame(np.hstack([X, scores]), columns=feat_cols + ['iso_score'])
+
+
+def make_sequences(df, X_arr, seq_len=SEQ_LEN):
+    """
+    Create sequences PER PRN (satellite) instead of mixing signals.
+    Prevents temporal corruption across satellites.
+    """
+    sequences = []
+
+    prn_values = df['PRN'].values
+
+    for prn in np.unique(prn_values):
+        idx = (prn_values == prn)
+        X_prn = X_arr[idx]
+
+        if len(X_prn) < seq_len:
+            continue
+
+        for i in range(len(X_prn) - seq_len + 1):
+            sequences.append(X_prn[i:i + seq_len])
+
+    return np.array(sequences)
 
 
 def batch_reconstruction_errors(model, seqs_np, batch_size=256):
@@ -63,34 +87,43 @@ def batch_reconstruction_errors(model, seqs_np, batch_size=256):
         torch.cuda.empty_cache()
     return np.concatenate(all_errors)
 
-def lstm_anomaly_scores(model, scaler, X_arr):
+def lstm_anomaly_scores(model, scaler, df, X_arr):
+    """Compute per-row LSTM reconstruction error."""
     X_norm = scaler.transform(X_arr)
-    seqs   = make_sequences(X_norm)
+    seqs   = make_sequences(df, X_norm)
+
     model.eval()
     errors = batch_reconstruction_errors(model, seqs)
+
     n_pad  = len(X_arr) - len(errors)
     return np.concatenate([np.full(n_pad, errors[0]), errors])
 
+
 def ensemble_probs(xgb_probs, lstm_scores, alpha=0.70):
+    """Blend XGBoost probabilities with normalised LSTM anomaly scores."""
     lo, hi    = lstm_scores.min(), lstm_scores.max()
     lstm_norm = (lstm_scores - lo) / (hi - lo + 1e-9)
     return alpha * xgb_probs + (1 - alpha) * lstm_norm
 
 def tune_threshold(probs, y_true):
+    """Find threshold that maximises binary F1 for spoofing detection."""
     best_t, best_f1 = 0.5, 0.0
-    for t in np.arange(0.01, 0.71, 0.01):
+    for t in np.arange(0.05, 0.95, 0.005):
         preds = (probs >= t).astype(int)
-        score = f1_score(y_true, preds, average="weighted", zero_division=0)
+        score = f1_score(y_true, preds, average="binary", zero_division=0)
         if score > best_f1:
             best_f1, best_t = score, t
-    print(f"Best threshold: {best_t:.2f}   Best weighted-F1: {best_f1:.4f}")
+    print(f"Best threshold: {best_t:.3f}   Best binary-F1: {best_f1:.4f}")
     return best_t
 
-def train_lstm(X_genuine, input_dim):
+def train_lstm(df_train, X_genuine, input_dim):
     scaler = StandardScaler()
     X_norm = scaler.fit_transform(X_genuine)
 
-    seqs = make_sequences(X_norm)
+    seqs = make_sequences(
+    df_train[df_train[TARGET] == 0],
+    X_norm,
+    SEQ_LEN)
     n_val   = max(1, int(len(seqs) * 0.15))
     n_train = len(seqs) - n_val
 
@@ -132,7 +165,7 @@ def train_xgboost(X, y):
 
     model = XGBClassifier(
         n_estimators          = 500,
-        max_depth             = 6,
+        max_depth             = 7,
         learning_rate         = 0.05,
         subsample             = 0.8,
         colsample_bytree      = 0.8,
@@ -144,19 +177,18 @@ def train_xgboost(X, y):
         verbosity             = 0,
     )
 
-    # TimeSeriesSplit preserves temporal order — no future leaking into past
-    from sklearn.model_selection import TimeSeriesSplit
-    kf        = TimeSeriesSplit(n_splits=5)
+    # StratifiedKFold CV — for metric reporting only
+    kf        = StratifiedKFold(n_splits=5, shuffle=True, random_state=SEED)
     oof_probs = np.zeros(len(y))
 
-    for fold, (tr_idx, val_idx) in enumerate(kf.split(X), 1):
+    for fold, (tr_idx, val_idx) in enumerate(kf.split(X, y), 1):
         Xtr, Xval = X[tr_idx], X[val_idx]
         ytr, yval = y[tr_idx], y[val_idx]
         model.fit(Xtr, ytr, eval_set=[(Xval, yval)], verbose=False)
         oof_probs[val_idx] = model.predict_proba(Xval)[:, 1]
         fold_f1 = f1_score(yval, (oof_probs[val_idx] >= 0.5).astype(int),
-                           average="weighted")
-        print(f"  Fold {fold}  weighted-F1: {fold_f1:.4f}")
+                           average="binary")
+        print(f"  Fold {fold}  binary-F1: {fold_f1:.4f}  (spoofed in val: {yval.sum()})")
 
     return model, oof_probs
 
@@ -164,23 +196,52 @@ def main(train_path="data/train.csv"):
     print("Loading raw data...")
     df_raw = pd.read_csv(train_path, low_memory=False)
 
-    # ── Temporal split BEFORE feature engineering ──────────────────────────
-    # Data is sequential so we split into two continuous blocks:
-    #   train = first 80% of timestamps
-    #   val   = last  20% of timestamps
-    # This prevents:
-    #   1. Future leaking into past via rolling features
-    #   2. cross_satellite_features mixing train/val rows at shared timestamps
-    # It also mimics real deployment where model predicts unseen future data.
-    unique_times   = np.sort(df_raw['time'].unique())
-    split_idx      = int(len(unique_times) * 0.80)
-    train_times    = unique_times[:split_idx]
-    val_times      = unique_times[split_idx:]
-    df_train_raw   = df_raw[df_raw['time'].isin(train_times)].copy()
-    df_val_raw     = df_raw[df_raw['time'].isin(val_times)].copy()
-    print(f"Temporal split — train timestamps: {len(train_times)}  val timestamps: {len(val_times)}")
+    # ── Stratified-temporal split BEFORE feature engineering ───────────────
+    # Pure temporal split (first 80% / last 20%) is BROKEN for this dataset:
+    # ALL spoofed data lives at timestamps 47743–63658, which falls entirely
+    # within the first 80%. The val set gets 0 spoofed rows → meaningless eval.
+    #
+    # Fix: split WITHIN the spoofed time range and genuine-only time range
+    # separately, so both train and val get spoofed samples.
+    # Feature engineering is still done separately on each split.
 
-    print("Engineering features on train split...")
+    # Convert target to numeric early (header rows have string "0")
+    df_raw[TARGET] = pd.to_numeric(df_raw[TARGET], errors='coerce').fillna(0).astype(int)
+
+    unique_times = np.sort(df_raw['time'].unique())
+
+    # Identify which timestamps contain spoofed data
+    spoofed_times = np.sort(df_raw[df_raw[TARGET] == 1]['time'].unique())
+    genuine_only_times = np.sort(np.setdiff1d(unique_times, spoofed_times))
+
+    # Split spoofed timestamps: first 80% train, last 20% val
+    sp_split = int(len(spoofed_times) * 0.80)
+    spoofed_train_times = set(spoofed_times[:sp_split])
+    spoofed_val_times   = set(spoofed_times[sp_split:])
+
+    # Split genuine-only timestamps: first 80% train, last 20% val
+    g_split = int(len(genuine_only_times) * 0.80)
+    genuine_train_times = set(genuine_only_times[:g_split])
+    genuine_val_times   = set(genuine_only_times[g_split:])
+
+    train_times = spoofed_train_times | genuine_train_times
+    val_times   = spoofed_val_times   | genuine_val_times
+
+    df_train_raw = df_raw[df_raw['time'].isin(train_times)].copy()
+    df_val_raw   = df_raw[df_raw['time'].isin(val_times)].copy()
+
+    print(f"Stratified-temporal split:")
+    print(f"  Train timestamps: {len(train_times)}  (spoofed: {len(spoofed_train_times)})")
+    print(f"  Val   timestamps: {len(val_times)}  (spoofed: {len(spoofed_val_times)})")
+
+    print("\n--- DATA CHECK ---")
+    train_spoofed = (df_train_raw[TARGET] == 1).sum()
+    val_spoofed   = (df_val_raw[TARGET] == 1).sum()
+    print(f"Train rows: {len(df_train_raw)}  (spoofed: {train_spoofed})")
+    print(f"Val   rows: {len(df_val_raw)}  (spoofed: {val_spoofed})")
+    assert val_spoofed > 0, "FATAL: Validation set has 0 spoofed samples! Split is broken."
+
+    print("\nEngineering features on train split...")
     df_train = build_features(df_train_raw)
     print("Engineering features on val split...")
     df_val   = build_features(df_val_raw)
@@ -192,6 +253,11 @@ def main(train_path="data/train.csv"):
     X_val   = df_val[feat_cols].values.astype(np.float32)
     y_val   = df_val[TARGET].values.astype(int)
 
+    print(f"\nAfter feature engineering:")
+    print(f"  Train: {len(X_train)} rows  (spoofed: {y_train.sum()})")
+    print(f"  Val:   {len(X_val)} rows  (spoofed: {y_val.sum()})")
+    assert y_val.sum() > 0, "FATAL: Val has 0 spoofed after feature engineering!"
+
     # Combine for full training after validation threshold is found
     X_all = np.vstack([X_train, X_val])
     y_all = np.concatenate([y_train, y_val])
@@ -199,37 +265,64 @@ def main(train_path="data/train.csv"):
     # LSTM — train on genuine-only rows from train split
     print("\n--- LSTM Autoencoder ---")
     lstm_model, scaler, lstm_thresh = train_lstm(
-        X_train[y_train == 0], input_dim=len(feat_cols)
-    )
+        df_train,
+        X_train[y_train == 0],
+        input_dim=len(feat_cols))
+    lstm_val_scores = lstm_anomaly_scores(lstm_model, scaler, df_val, X_val)
 
-    # Get LSTM scores on val split for honest threshold tuning
-    lstm_val_scores = lstm_anomaly_scores(lstm_model, scaler, X_val)
+    # Isolation Forest — trained on genuine-only, score appended for XGBoost
+    print("\n--- Isolation Forest ---")
+    iso = IsolationForest(n_estimators=200, contamination=0.05,
+                         max_samples=0.8, random_state=SEED, n_jobs=-1)
+    iso.fit(X_train[y_train == 0])
+    print(f"Isolation Forest trained on {(y_train == 0).sum()} genuine rows.")
+    X_train_aug = add_iso_score(iso, X_train, feat_cols)
+    X_val_aug   = add_iso_score(iso, X_val,   feat_cols)
+    aug_cols    = feat_cols + ['iso_score']
 
-    # XGBoost — train on train split, evaluate on val split
+    # XGBoost — train on augmented features (with iso score)
     print("\n--- XGBoost ---")
-    xgb_model, xgb_oof = train_xgboost(X_train, y_train)
-    xgb_val_probs = xgb_model.predict_proba(X_val)[:, 1]
+    xgb_model, xgb_oof = train_xgboost(X_train_aug.values, y_train)
+    xgb_val_probs = xgb_model.predict_proba(X_val_aug)[:, 1]
 
-    # Threshold tuning on held-out val split — honest evaluation
+    # Ensemble — 70% XGBoost + 30% LSTM
     print("\n--- Ensemble & Threshold Tuning (on val split) ---")
     val_ens     = ensemble_probs(xgb_val_probs, lstm_val_scores, alpha=0.70)
     best_thresh = tune_threshold(val_ens, y_val)
 
-    val_f1 = f1_score(y_val, (val_ens >= best_thresh).astype(int), average="weighted")
-    print(f"Honest val weighted-F1: {val_f1:.4f}")
+    val_f1_binary   = f1_score(y_val, (val_ens >= best_thresh).astype(int), average="binary")
+    val_f1_weighted = f1_score(y_val, (val_ens >= best_thresh).astype(int), average="weighted")
+    print(f"Val binary-F1  (spoofing detection): {val_f1_binary:.4f}")
+    print(f"Val weighted-F1 (overall):           {val_f1_weighted:.4f}")
 
-    # Retrain XGBoost on full data for final model
-    # Remove early_stopping_rounds since there is no eval_set here
-    print("\nRetraining XGBoost on full data...")
+    # Confusion matrix on val split
+    val_preds = (val_ens >= best_thresh).astype(int)
+    cm = confusion_matrix(y_val, val_preds, labels=[0, 1])
+    tn, fp, fn, tp = cm.ravel()
+    print("\nConfusion Matrix (val split):")
+    print(f"  TN (genuine correctly rejected) : {tn:>7}")
+    print(f"  FP (genuine flagged as spoofed) : {fp:>7}")
+    print(f"  FN (spoofed missed)             : {fn:>7}")
+    print(f"  TP (spoofed correctly caught)   : {tp:>7}")
+    print(f"\n{classification_report(y_val, val_preds, labels=[0, 1], target_names=['Genuine', 'Spoofed'], zero_division=0)}")
+
+    # Retrain on full data for final model
+    print("\nRetraining on full data...")
+    iso_final = IsolationForest(n_estimators=200, contamination=0.05,
+                                max_samples=0.8, random_state=SEED, n_jobs=-1)
+    iso_final.fit(X_all[y_all == 0])
+    X_all_aug = add_iso_score(iso_final, X_all, feat_cols)
     xgb_model.set_params(early_stopping_rounds=None)
-    xgb_model.fit(X_all, y_all)
+    xgb_model.fit(X_all_aug, y_all)
 
     # Save all artefacts
-    joblib.dump(xgb_model, f"{MODEL_DIR}/xgb_model.pkl")
-    joblib.dump(scaler,    f"{MODEL_DIR}/lstm_scaler.pkl")
+    joblib.dump(xgb_model,  f"{MODEL_DIR}/xgb_model.pkl")
+    joblib.dump(scaler,     f"{MODEL_DIR}/lstm_scaler.pkl")
+    joblib.dump(iso_final,  f"{MODEL_DIR}/iso_forest.pkl")
     joblib.dump({
         "threshold":   best_thresh,
         "feat_cols":   feat_cols,
+        "aug_cols":    aug_cols,
         "lstm_thresh": lstm_thresh,
     }, f"{MODEL_DIR}/config.pkl")
     torch.save(lstm_model.state_dict(), f"{MODEL_DIR}/lstm_model.pt")
