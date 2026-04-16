@@ -74,7 +74,7 @@ pip install -r requirements.txt
 cd src
 python train.py
 ```
-Takes about 5-10 minutes depending on hardware. Saves all artefacts to `models/`.
+Saves all artefacts to `models/`.
 
 **Predict:**
 ```bash
