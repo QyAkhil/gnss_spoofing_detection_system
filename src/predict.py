@@ -5,7 +5,7 @@ import joblib
 import torch
 
 from model import LSTMAutoencoder
-from features import build_features
+from features import build_features, aggregate_to_time_level
 from train import lstm_anomaly_scores, ensemble_probs, add_iso_score
 
 MODEL_DIR = "models"
@@ -32,16 +32,23 @@ def predict(test_path="data/test.csv", out_path="outputs/submission.csv"):
     # Load and engineer test features
     print("Loading test data...")
     df = pd.read_csv(test_path, low_memory=False)
+
+    # Per-channel feature engineering
     df = build_features(df)
 
-    for c in feat_cols:
-        if c not in df.columns:
-            df[c] = 0.0
+    # Aggregate 8 channels → 1 row per timestamp
+    print("Aggregating channels to time level...")
+    df_agg = aggregate_to_time_level(df, has_target=False)
 
-    X = df[feat_cols].values.astype(np.float32)
+    # Ensure all expected feature columns exist
+    for c in feat_cols:
+        if c not in df_agg.columns:
+            df_agg[c] = 0.0
+
+    X = df_agg[feat_cols].values.astype(np.float32)
 
     # Match training: LSTM scores + iso-augmented XGBoost + 70/30 ensemble
-    lstm_scores = lstm_anomaly_scores(lstm_model, scaler, df, X)
+    lstm_scores = lstm_anomaly_scores(lstm_model, scaler, X)
     X_aug = add_iso_score(iso, X, feat_cols)
     xgb_probs = xgb_model.predict_proba(X_aug)[:, 1]
 
@@ -49,15 +56,18 @@ def predict(test_path="data/test.csv", out_path="outputs/submission.csv"):
     preds = (ens >= threshold).astype(int)
 
     print(f"Predictions — Spoofed: {preds.sum()}  Genuine: {(preds == 0).sum()}")
+    print(f"Total timestamps: {len(preds)}")
 
-    df["spoofed"]    = preds
-    df["confidence"] = ens
-
-    submission = df[["spoofed", "confidence"]].copy()
+    # Output: one row per timestamp with time, spoofed, confidence
+    submission = pd.DataFrame({
+        "time":       df_agg["time"].values,
+        "spoofed":    preds,
+        "confidence": ens,
+    })
 
     os.makedirs("outputs", exist_ok=True)
     submission.to_csv(out_path, index=False)
-    print(f"Saved {len(submission)} rows -> {out_path}")
+    print(f"Saved {len(submission)} timestamps -> {out_path}")
 
 
 if __name__ == "__main__":

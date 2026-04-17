@@ -190,3 +190,97 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.fillna(0)
     print(f"Done. Shape: {df.shape}")
     return df
+
+
+# ─────────────────────────────────────────────
+# TIME-LEVEL AGGREGATION
+# ─────────────────────────────────────────────
+# Each timestamp has exactly 8 channels with identical spoofing labels.
+# We aggregate per-channel features across the 8 channels using
+# mean / std / min / max to produce ONE row per timestamp.
+
+# Features that are already cross-satellite (computed at time level)
+# — just take the first value since they're identical across channels.
+_TIME_LEVEL_COLS = {
+    'CN0_mean_time', 'CN0_std_time',
+    'Carrier_Doppler_hz_mean_time', 'Carrier_Doppler_hz_std_time',
+    'Pseudorange_m_mean_time', 'Pseudorange_m_std_time',
+    'prn_count',
+}
+
+# Per-channel features to aggregate with mean/std/min/max
+_PER_CHANNEL_FEATURES = [
+    'correlator_symmetry', 'correlator_distortion',
+    'prompt_balance', 'pip_pqp_ratio', 'PC_magnitude',
+    'ec_lc_ratio', 'el_power_ratio',
+    'residual_PD', 'timing_residual',
+    'carrier_pseudo_consistency', 'doppler_phase_consistency',
+    'pseudo_rate', 'doppler_velocity',
+    'phase_jump', 'tcd_jump', 'real_pseudo_jump',
+    'pseudo_rate_accel', 'tow_jump',
+    'Carrier_Doppler_hz_roll_std', 'CN0_roll_std', 'Pseudorange_m_roll_std',
+    'Carrier_Doppler_hz_diff', 'CN0_diff', 'Pseudorange_m_diff',
+    'CN0_dev', 'pseudo_zero_flag',
+    'doppler_dev', 'pseudo_dev',
+]
+
+
+def aggregate_to_time_level(df: pd.DataFrame,
+                            has_target: bool = True) -> pd.DataFrame:
+    """
+    Collapse 8 channel-rows per timestamp into 1 row per timestamp.
+
+    Parameters
+    ----------
+    df : DataFrame with per-channel features (output of build_features)
+    has_target : True for training data (has 'spoofed' column)
+
+    Returns
+    -------
+    DataFrame with one row per 'time', aggregated features.
+    """
+    per_ch = [c for c in _PER_CHANNEL_FEATURES if c in df.columns]
+    time_lvl = [c for c in _TIME_LEVEL_COLS if c in df.columns]
+
+    # Build aggregation dict
+    agg_dict = {}
+
+    # Per-channel features → mean, std, min, max
+    for col in per_ch:
+        agg_dict[col] = ['mean', 'std', 'min', 'max']
+
+    # Time-level features → just take first (identical across channels)
+    for col in time_lvl:
+        agg_dict[col] = 'first'
+
+    if has_target and 'spoofed' in df.columns:
+        agg_dict['spoofed'] = 'max'  # all same within a timestamp
+
+    grouped = df.groupby('time').agg(agg_dict)
+
+    # Flatten multi-level column names: ('correlator_symmetry', 'mean') → 'correlator_symmetry_mean'
+    new_cols = []
+    for col in grouped.columns:
+        if isinstance(col, tuple):
+            # Time-level cols and target: keep original name (no suffix)
+            if col[1] == 'first' or col[0] == 'spoofed':
+                new_cols.append(col[0])
+            else:
+                new_cols.append(f"{col[0]}_{col[1]}")
+        else:
+            new_cols.append(col)
+
+    grouped.columns = new_cols
+    grouped = grouped.reset_index()
+
+    # Replace NaN std (can happen if a channel feature is constant across 8 channels)
+    grouped = grouped.fillna(0)
+
+    print(f"Aggregated to time level: {grouped.shape[0]} timestamps × {grouped.shape[1]} columns")
+    return grouped
+
+
+def get_time_level_feature_cols(df: pd.DataFrame) -> list:
+    """Return the list of feature column names from an aggregated DataFrame."""
+    exclude = {'time', 'spoofed'}
+    return [c for c in df.columns if c not in exclude]

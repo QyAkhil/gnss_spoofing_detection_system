@@ -12,7 +12,7 @@ from sklearn.preprocessing import StandardScaler
 
 from sklearn.ensemble import IsolationForest
 from model import LSTMAutoencoder
-from features import build_features
+from features import build_features, aggregate_to_time_level, get_time_level_feature_cols
 
 # ─────────────────────────────────────────────
 # CONFIG
@@ -29,23 +29,6 @@ os.makedirs(MODEL_DIR, exist_ok=True)
 torch.manual_seed(SEED)
 np.random.seed(SEED)
 
-FEATURE_COLS = [
-    "correlator_symmetry", "correlator_distortion",
-    "prompt_balance", "pip_pqp_ratio", "PC_magnitude",
-    "ec_lc_ratio", "el_power_ratio",
-    "residual_PD", "timing_residual",
-    "carrier_pseudo_consistency", "doppler_phase_consistency",
-    "pseudo_rate", "doppler_velocity",
-    "phase_jump", "tcd_jump", "real_pseudo_jump",
-    "pseudo_rate_accel", "tow_jump",
-    "Carrier_Doppler_hz_roll_std", "CN0_roll_std", "Pseudorange_m_roll_std",
-    "Carrier_Doppler_hz_diff", "CN0_diff", "Pseudorange_m_diff",
-    "CN0_mean_time", "CN0_std_time",
-    "Carrier_Doppler_hz_std_time", "Pseudorange_m_std_time",
-    "CN0_dev", "prn_count", "pseudo_zero_flag",
-    "doppler_dev", "pseudo_dev",
-]
-
 
 def add_iso_score(iso: IsolationForest, X: np.ndarray, feat_cols: list) -> pd.DataFrame:
     """Append Isolation Forest anomaly score as a named column."""
@@ -53,24 +36,18 @@ def add_iso_score(iso: IsolationForest, X: np.ndarray, feat_cols: list) -> pd.Da
     return pd.DataFrame(np.hstack([X, scores]), columns=feat_cols + ['iso_score'])
 
 
-def make_sequences(df, X_arr, seq_len=SEQ_LEN):
+def make_sequences(X_arr, seq_len=SEQ_LEN):
     """
-    Create sequences PER PRN (satellite) instead of mixing signals.
-    Prevents temporal corruption across satellites.
+    Create sequences over consecutive timestamps.
+    Each row is one timestamp (already aggregated across 8 channels),
+    so sliding windows capture temporal evolution directly.
     """
+    if len(X_arr) < seq_len:
+        return np.array([])
+
     sequences = []
-
-    prn_values = df['PRN'].values
-
-    for prn in np.unique(prn_values):
-        idx = (prn_values == prn)
-        X_prn = X_arr[idx]
-
-        if len(X_prn) < seq_len:
-            continue
-
-        for i in range(len(X_prn) - seq_len + 1):
-            sequences.append(X_prn[i:i + seq_len])
+    for i in range(len(X_arr) - seq_len + 1):
+        sequences.append(X_arr[i:i + seq_len])
 
     return np.array(sequences)
 
@@ -87,22 +64,32 @@ def batch_reconstruction_errors(model, seqs_np, batch_size=256):
         torch.cuda.empty_cache()
     return np.concatenate(all_errors)
 
-def lstm_anomaly_scores(model, scaler, df, X_arr):
-    """Compute per-row LSTM reconstruction error."""
+def lstm_anomaly_scores(model, scaler, X_arr):
+    """Compute per-timestamp LSTM reconstruction error."""
     X_norm = scaler.transform(X_arr)
-    seqs   = make_sequences(df, X_norm)
+    seqs   = make_sequences(X_norm)
+
+    if len(seqs) == 0:
+        return np.zeros(len(X_arr))
 
     model.eval()
     errors = batch_reconstruction_errors(model, seqs)
 
+    # Pad the initial timestamps that don't have full sequences
     n_pad  = len(X_arr) - len(errors)
     return np.concatenate([np.full(n_pad, errors[0]), errors])
 
 
 def ensemble_probs(xgb_probs, lstm_scores, alpha=0.70):
-    """Blend XGBoost probabilities with normalised LSTM anomaly scores."""
-    lo, hi    = lstm_scores.min(), lstm_scores.max()
-    lstm_norm = (lstm_scores - lo) / (hi - lo + 1e-9)
+    """Blend XGBoost probabilities with normalised LSTM anomaly scores.
+    
+    Uses robust percentile-based normalization (1st–99th percentile)
+    to prevent extreme outliers from collapsing the score distribution.
+    """
+    lo = np.percentile(lstm_scores, 1)
+    hi = np.percentile(lstm_scores, 99)
+    lstm_clipped = np.clip(lstm_scores, lo, hi)
+    lstm_norm = (lstm_clipped - lo) / (hi - lo + 1e-9)
     return alpha * xgb_probs + (1 - alpha) * lstm_norm
 
 def tune_threshold(probs, y_true):
@@ -116,14 +103,15 @@ def tune_threshold(probs, y_true):
     print(f"Best threshold: {best_t:.3f}   Best binary-F1: {best_f1:.4f}")
     return best_t
 
-def train_lstm(df_train, X_genuine, input_dim):
+def train_lstm(X_genuine, input_dim):
+    """Train LSTM autoencoder on genuine-only time-level data."""
     scaler = StandardScaler()
     X_norm = scaler.fit_transform(X_genuine)
 
-    seqs = make_sequences(
-    df_train[df_train[TARGET] == 0],
-    X_norm,
-    SEQ_LEN)
+    seqs = make_sequences(X_norm, SEQ_LEN)
+    if len(seqs) == 0:
+        raise ValueError("Not enough genuine timestamps to create LSTM sequences")
+
     n_val   = max(1, int(len(seqs) * 0.15))
     n_train = len(seqs) - n_val
 
@@ -241,41 +229,51 @@ def main(train_path="data/train.csv"):
     print(f"Val   rows: {len(df_val_raw)}  (spoofed: {val_spoofed})")
     assert val_spoofed > 0, "FATAL: Validation set has 0 spoofed samples! Split is broken."
 
+    # ── Feature engineering (per-channel) then aggregate to time level ────
     print("\nEngineering features on train split...")
-    df_train = build_features(df_train_raw)
+    df_train_ch = build_features(df_train_raw)
     print("Engineering features on val split...")
-    df_val   = build_features(df_val_raw)
+    df_val_ch   = build_features(df_val_raw)
 
-    feat_cols = [c for c in FEATURE_COLS if c in df_train.columns]
+    print("\nAggregating channels to time level...")
+    df_train = aggregate_to_time_level(df_train_ch, has_target=True)
+    df_val   = aggregate_to_time_level(df_val_ch,   has_target=True)
+
+    # Get feature columns (everything except 'time' and 'spoofed')
+    feat_cols = get_time_level_feature_cols(df_train)
+    # Ensure val has same columns
+    for c in feat_cols:
+        if c not in df_val.columns:
+            df_val[c] = 0.0
+    feat_cols = [c for c in feat_cols if c in df_val.columns]
 
     X_train = df_train[feat_cols].values.astype(np.float32)
     y_train = df_train[TARGET].values.astype(int)
     X_val   = df_val[feat_cols].values.astype(np.float32)
     y_val   = df_val[TARGET].values.astype(int)
 
-    print(f"\nAfter feature engineering:")
-    print(f"  Train: {len(X_train)} rows  (spoofed: {y_train.sum()})")
-    print(f"  Val:   {len(X_val)} rows  (spoofed: {y_val.sum()})")
-    assert y_val.sum() > 0, "FATAL: Val has 0 spoofed after feature engineering!"
+    print(f"\nAfter time-level aggregation:")
+    print(f"  Train: {len(X_train)} timestamps  (spoofed: {y_train.sum()})  features: {len(feat_cols)}")
+    print(f"  Val:   {len(X_val)} timestamps  (spoofed: {y_val.sum()})  features: {len(feat_cols)}")
+    assert y_val.sum() > 0, "FATAL: Val has 0 spoofed after aggregation!"
 
     # Combine for full training after validation threshold is found
     X_all = np.vstack([X_train, X_val])
     y_all = np.concatenate([y_train, y_val])
 
-    # LSTM — train on genuine-only rows from train split
+    # LSTM — train on genuine-only timestamps from train split
     print("\n--- LSTM Autoencoder ---")
     lstm_model, scaler, lstm_thresh = train_lstm(
-        df_train,
         X_train[y_train == 0],
         input_dim=len(feat_cols))
-    lstm_val_scores = lstm_anomaly_scores(lstm_model, scaler, df_val, X_val)
+    lstm_val_scores = lstm_anomaly_scores(lstm_model, scaler, X_val)
 
     # Isolation Forest — trained on genuine-only, score appended for XGBoost
     print("\n--- Isolation Forest ---")
     iso = IsolationForest(n_estimators=200, contamination=0.05,
                          max_samples=0.8, random_state=SEED, n_jobs=-1)
     iso.fit(X_train[y_train == 0])
-    print(f"Isolation Forest trained on {(y_train == 0).sum()} genuine rows.")
+    print(f"Isolation Forest trained on {(y_train == 0).sum()} genuine timestamps.")
     X_train_aug = add_iso_score(iso, X_train, feat_cols)
     X_val_aug   = add_iso_score(iso, X_val,   feat_cols)
     aug_cols    = feat_cols + ['iso_score']
@@ -299,7 +297,7 @@ def main(train_path="data/train.csv"):
     val_preds = (val_ens >= best_thresh).astype(int)
     cm = confusion_matrix(y_val, val_preds, labels=[0, 1])
     tn, fp, fn, tp = cm.ravel()
-    print("\nConfusion Matrix (val split):")
+    print("\nConfusion Matrix (val split — per timestamp):")
     print(f"  TN (genuine correctly rejected) : {tn:>7}")
     print(f"  FP (genuine flagged as spoofed) : {fp:>7}")
     print(f"  FN (spoofed missed)             : {fn:>7}")
