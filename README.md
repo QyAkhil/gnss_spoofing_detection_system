@@ -47,7 +47,6 @@ gnss_spoofing_detection_system/
 |   |-- model.py           # LSTM autoencoder architecture
 |   |-- train.py           # Training script (main entry point)
 |   |-- predict.py         # Generate submission from trained models
-|   |-- check.py           # Diagnostic plots and reports
 |
 |-- models/                # Saved model artefacts (after training)
 |   |-- xgb_model.pkl
